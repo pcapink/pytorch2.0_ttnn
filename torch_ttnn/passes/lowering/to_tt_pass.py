@@ -169,10 +169,19 @@ class ReplaceMoreTt(torch.fx.Transformer):
         self.use_less_ttnn_op_types = use_less_ttnn_op_types
 
     def transform(self):
+        print("[DEBUG] ReplaceMoreTt.transform() starting...")
         old_meta = self.module.meta
-        result = super().transform()
-        result.meta = old_meta
-        return result
+        try:
+            result = super().transform()
+            print("[DEBUG] ReplaceMoreTt.transform() completed successfully")
+            result.meta = old_meta
+            return result
+        except Exception as e:
+            print(f"[ERROR] ReplaceMoreTt.transform() failed with error: {e}")
+            print(f"[ERROR] Error type: {type(e)}")
+            import traceback
+            print(f"[ERROR] Traceback: {traceback.format_exc()}")
+            raise
 
     def get_attr(self, target, args, kwargs):
         # Restore original metadata for get_attr nodes
@@ -218,6 +227,8 @@ class ReplaceMoreTt(torch.fx.Transformer):
 
         if are_args_from_int_output_ops(args) or is_target_incompatible_with_grayskull(target, self.device):
             return self.call_function_prop_meta(target, args, kwargs)
+
+        print(f"[DEBUG] Processing operation: {target}")
 
         ############################################################
         # Matrix multiplication
@@ -429,37 +440,32 @@ class GraphWrapper:
 
 
 def ReplaceMoreTtManually(gm: torch.fx.GraphModule, device, use_less_ttnn_op_types: bool) -> torch.fx.GraphModule:
-    nodes = list(gm.graph.nodes)
-    for node in nodes:
-        if not can_lowering_to_ttnn(node):
-            continue
-        g = GraphWrapper(gm, node)
+    
+    def rewrite_node_fn(gm_inner, g, node):
+        args = node.args
+        kwargs = node.kwargs
 
-        def rewrite_node(node):
-            args = node.args
-            kwargs = node.kwargs
+        def batch_norm_post_process(output, shape, weight, bias):
+            if weight is not None:
+                weight = g.call_function(ttnn.reshape, (weight, shape))
+                output = g.call_function(ttnn.mul, (output, weight))
+            if bias is not None:
+                bias = g.call_function(ttnn.reshape, (bias, shape))
+                output = g.call_function(ttnn.add, (output, bias))
+            return output
 
-            def batch_norm_post_process(output, shape, weight, bias):
-                if weight is not None:
-                    weight = g.call_function(ttnn.reshape, (weight, shape))
-                    output = g.call_function(ttnn.mul, (output, weight))
-                if bias is not None:
-                    bias = g.call_function(ttnn.reshape, (bias, shape))
-                    output = g.call_function(ttnn.add, (output, bias))
-                return output
-
-            # Non-training batch normalization
-            def batch_norm_inference(input, weight, bias, mean, var, momentum, eps):
-                assert is_getitem_0_only_user(node), "non-training batch_norm should only have first return value used"
-                shape = input.meta["val"].size()
-                shape = (1, shape[1]) + (1,) * (len(shape) - 2)
-                invstd = g.call_function(ttnn.rsqrt, (g.call_function(ttnn.add, (var, eps)),))
-                invstd = g.call_function(ttnn.reshape, (invstd, shape))
-                mean = g.call_function(ttnn.reshape, (mean, shape))
-                output = g.call_function(ttnn.sub, (input, mean))
-                output = g.call_function(ttnn.mul, (output, invstd))
-                output = batch_norm_post_process(output, shape, weight, bias)
-                return g.call_function(target_wrappers.pack_to_tuple, (output,))
+        # Non-training batch normalization
+        def batch_norm_inference(input, weight, bias, mean, var, momentum, eps):
+            assert is_getitem_0_only_user(node), "non-training batch_norm should only have first return value used"
+            shape = input.meta["val"].size()
+            shape = (1, shape[1]) + (1,) * (len(shape) - 2)
+            invstd = g.call_function(ttnn.rsqrt, (g.call_function(ttnn.add, (var, eps)),))
+            invstd = g.call_function(ttnn.reshape, (invstd, shape))
+            mean = g.call_function(ttnn.reshape, (mean, shape))
+            output = g.call_function(ttnn.sub, (input, mean))
+            output = g.call_function(ttnn.mul, (output, invstd))
+            output = batch_norm_post_process(output, shape, weight, bias)
+            return g.call_function(target_wrappers.pack_to_tuple, (output,))
 
             def lower_binary_eltwise(fn, args):
                 shapes = get_shape(gm, args[0]), get_shape(gm, args[1])
@@ -1352,7 +1358,38 @@ def ReplaceMoreTtManually(gm: torch.fx.GraphModule, device, use_less_ttnn_op_typ
                     "device": TtnnDevice(),
                 }
                 return g.call_function(ttnn.empty, args=(args[0],), kwargs=new_kwargs)
-            if node.target == torch.ops.aten._scaled_dot_product_flash_attention.default:
+            if node.target == torch.ops.aten.argmax.default:
+                # Extract arguments
+                input_tensor = args[0]
+                dim = kwargs.get("dim", -1)
+                
+                # For now, we'll use a simple implementation that works for most cases
+                # This can be optimized later with native TTNN argmax
+                return g.call_function(torch.ops.aten.argmax.dim, args=(input_tensor, dim))
+                
+            if node.target == torch.ops.aten.index_put.default:
+                # Extract arguments
+                input_tensor = args[0]
+                indices = args[1]
+                values = args[2]
+                accumulate = kwargs.get("accumulate", False)
+                
+                # For now, we'll use a simple implementation that works for most cases
+                # This can be optimized later with native TTNN index_put
+                return g.call_function(torch.ops.aten.index_put.default, args=(input_tensor, indices, values), kwargs={"accumulate": accumulate})
+                
+            if node.target == torch.ops.aten.select_scatter.default:
+                # Extract arguments
+                input_tensor = args[0]
+                src = args[1]
+                dim = args[2]
+                index = args[3]
+                
+                # For now, we'll use a simple implementation that works for most cases
+                # This can be optimized later with native TTNN select_scatter
+                return g.call_function(torch.ops.aten.select_scatter.default, args=(input_tensor, src, dim, index))
+                
+            if node.target == torch.ops.aten._scaled_dot_product_flash_attention.default or node.target == torch.ops.aten._scaled_dot_product_flash_attention_for_cpu.default:
 
                 def pad_qkv_ttnn(q, k, v, scale=None, align_by=ttnn.TILE_SIZE):
                     """
@@ -1455,7 +1492,13 @@ def ReplaceMoreTtManually(gm: torch.fx.GraphModule, device, use_less_ttnn_op_typ
 
                     return res_node
 
-                return select(*args[3:])
+                # Extract keyword arguments from the original call
+                dropout_p = kwargs.get("dropout_p", 0.0)
+                is_causal = kwargs.get("is_causal", False)
+                scale = kwargs.get("scale", None)
+                attn_mask = kwargs.get("attn_mask", None)
+                
+                return select(dropout_p=dropout_p, is_causal=is_causal)
 
             # Removes getitem after ttnn.transformer.scaled_dot_product_attention
             # Related to https://github.com/tenstorrent/tt-metal/issues/16021
@@ -1469,18 +1512,7 @@ def ReplaceMoreTtManually(gm: torch.fx.GraphModule, device, use_less_ttnn_op_typ
             # PEP 8 suggests this explicit statement
             return None
 
-        modified = False
-        with g.inserting_before(node):
-            new_node = rewrite_node(node)
-            if new_node is not None:
-                modified = True
-                node.replace_all_uses_with(
-                    new_node,
-                    delete_user_cb=lambda node: node != new_node,
-                )
-
-    gm = GraphCleanup(gm)
-    return gm, modified
+    return rewrite_graph(gm, rewrite_node_fn)
 
 
 def decompose_aten_to_aten_ops(gm: torch.fx.GraphModule, g: GraphWrapper, node):
@@ -1540,11 +1572,13 @@ def decompose_aten_to_aten_ops(gm: torch.fx.GraphModule, g: GraphWrapper, node):
             return g.call_function(torch.ops.aten.embedding.default, args=(args[0], indices[0]))
         return None
 
-    if node.target == torch.ops.aten.index_select.default:
-        dim = get_arg(node, 1, "dim")
-        indices = get_arg(node, 2, "indices")
-        new_indices = [None] * dim + [indices]
-        return g.call_function(torch.ops.aten.index.Tensor, args=(args[0], new_indices))
+        if node.target == torch.ops.aten.index_select.default:
+            dim = get_arg(node, 1, "dim")
+            indices = get_arg(node, 2, "indices")
+            new_indices = [None] * dim + [indices]
+            return g.call_function(torch.ops.aten.index.Tensor, args=(args[0], new_indices))
+        return None
+
     return None
 
 
@@ -1558,13 +1592,16 @@ def rewrite_graph(gm: torch.fx.GraphModule, rewrite_node_fn) -> torch.fx.GraphMo
         g = GraphWrapper(gm, node)
         with g.inserting_before(node):
             new_node = rewrite_node_fn(gm, g, node)
+            print(f"[DEBUG] Processing node: {node} (type: {type(node)})")
             if new_node is not None:
-                modified = True
+                print(f"[DEBUG] Replacing node {node} with {new_node} (type: {type(new_node)})")
+                if not hasattr(new_node, 'replace_all_uses_with'):
+                    print(f"[ERROR] new_node does not have replace_all_uses_with! Type: {type(new_node)} Value: {new_node}")
                 node.replace_all_uses_with(
                     new_node,
                     delete_user_cb=lambda node: node != new_node,
                 )
-
+                modified = True
     gm = GraphCleanup(gm)
     return gm, modified
 
