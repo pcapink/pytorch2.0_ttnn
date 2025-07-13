@@ -287,6 +287,13 @@ def calculate_accuracy(original_outputs, compiled_outputs) -> float:
         # Base case: Outputs are Torch tensors
         _, accuracy = comp_pcc(original_outputs, compiled_outputs)
         return accuracy
+    elif isinstance(original_outputs, str) and isinstance(compiled_outputs, str):
+        # Outputs are strings (e.g., transcribed text from Whisper)
+        if original_outputs == compiled_outputs:
+            return 1.0  # Perfect match
+        else:
+            # Simple string similarity - could be improved with more sophisticated metrics
+            return 0.0  # No match for now
     elif (isinstance(original_outputs, list) and isinstance(compiled_outputs, list)) or (
         isinstance(original_outputs, tuple) and isinstance(compiled_outputs, tuple)
     ):
